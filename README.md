@@ -48,6 +48,16 @@ curl -s 127.0.0.1:5280/   # status: link state, nodes seen, counters
   `/opt/tmwaccess` with a systemd unit (`tmwaccess`). With kernel Tailscale on
   the mini PC, leave `SOCKS5` unset.
 
+## Where it runs
+
+| Site | Host | LAN | Gateway id |
+|---|---|---|---|
+| EsanHouse | Intel NUC `innowing-NUC14RVK-B` (Ubuntu 22.04, Tailscale `100.122.39.52`), systemd `tmwaccess` | `192.168.0.43` (Wi-Fi; reserve it in the router's DHCP) | `esanhouse-nuc` |
+
+The dev Mac ran it first (`esanhouse-mac`), but that instance is retired: the
+Mac's VPN intermittently blocks inbound LAN traffic, which silently cut the
+Above M3 node off while the node itself was working.
+
 ## Point nodes at it
 
 A TMnode sends to the edges set on it over USB serial:
@@ -58,9 +68,8 @@ save
 reboot
 ```
 
-The dev Mac is `192.168.0.179`. That's the node's default, so the live
-"Above M3" node needed no change. When the mini PC takes over, give it a
-fixed LAN address and re-point the nodes.
+Above M3 (`30:ed:a0:cb:f5:f8`) is set to `192.168.0.43`, the NUC, and that
+setting is saved in the node's flash.
 
 ## Tests
 
