@@ -10,18 +10,21 @@
  * HMAC exactly as if the node were on its own network.
  *
  * The link is outbound only, so the gateway's site needs no inbound port and
- * works behind NAT, on campus Wi-Fi, or through a SOCKS5 proxy.
+ * works behind NAT, on campus Wi-Fi, or through a SOCKS5 proxy. It can take
+ * several routes (e.g. Cloudflare Tunnel first, Tailscale as fallback): the
+ * first that works carries the link, and while on a fallback the primary is
+ * retried periodically and taken back as soon as it answers.
  */
 import dgram from 'node:dgram';
 import { EventEmitter } from 'node:events';
-import { createServer, connect, BlockList, isIP, type Server, type Socket } from 'node:net';
+import { createServer, BlockList, isIP, type Server } from 'node:net';
 import { randomBytes } from 'node:crypto';
 import type { Config } from './config.js';
 import {
   addressed, frame, FrameReader, helloMac, parseAddressed, tmShape,
   T_DENY, T_DOWNLINK, T_HELLO, T_PING, T_PONG, T_STATS, T_UPLINK, T_WELCOME, TM_COMMAND, TM_UPLINK_TYPES, TMGW_VERSION,
 } from './gwlink.js';
-import { socks5Connect } from './socks5.js';
+import { describe, openRoute, type Pipe } from './transport.js';
 
 export const VERSION = '1.0.0';
 const DEAD_LINK_MS = 45_000;
@@ -43,7 +46,9 @@ export class Gateway extends EventEmitter {
   readonly nodes = new Map<string, NodeSeen>();
   private readonly udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
   private readonly allow = new BlockList();
-  private link: Socket | null = null;
+  private link: Pipe | null = null;
+  private routeIndex = -1;
+  private failbackTimer: NodeJS.Timeout | null = null;
   private state: LinkState = 'down';
   private edgeId: string | null = null;
   private queue: Buffer[] = [];
@@ -85,6 +90,7 @@ export class Gateway extends EventEmitter {
     this.stopped = true;
     for (const t of this.timers) clearInterval(t);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.failbackTimer) clearInterval(this.failbackTimer);
     this.link?.destroy();
     this.statusServer?.close();
     await new Promise<void>((resolve) => this.udp.close(() => resolve()));
@@ -123,7 +129,7 @@ export class Gateway extends EventEmitter {
     if (this.state === 'up' && this.link) {
       // A stalled link must not grow memory without bound: past a couple of
       // MB unsent, drop -- a REPORT is superseded a second later anyway.
-      if (this.link.writableLength > MAX_BUFFERED_BYTES) {
+      if (this.link.buffered() > MAX_BUFFERED_BYTES) {
         this.counters.droppedBackpressure += 1;
         return;
       }
@@ -174,79 +180,143 @@ export class Gateway extends EventEmitter {
 
   // --- link -----------------------------------------------------------------------
 
+  /** Try each route in order; the first to complete the handshake carries the link. */
   private connect(): void {
     if (this.stopped || this.state !== 'down') return;
     this.state = 'connecting';
-    const via = this.cfg.socks5 ? ` via SOCKS5 ${this.cfg.socks5.host}:${this.cfg.socks5.port}` : '';
-    const open: Promise<Socket> = this.cfg.socks5
-      ? socks5Connect(this.cfg.socks5.host, this.cfg.socks5.port, this.cfg.edgeHost, this.cfg.edgePort)
-      : new Promise((resolve, reject) => {
-        const s = connect(this.cfg.edgePort, this.cfg.edgeHost);
-        const t = setTimeout(() => { s.destroy(); reject(new Error('connect timed out')); }, 10_000);
-        s.once('connect', () => { clearTimeout(t); resolve(s); });
-        s.once('error', (e) => { clearTimeout(t); reject(e); });
-      });
-    open.then((s) => this.handshake(s), (err: Error) => this.linkDown(`cannot reach edge ${this.cfg.edgeHost}:${this.cfg.edgePort}${via}: ${err.message}`));
+    void (async () => {
+      const errors: string[] = [];
+      for (let i = 0; i < this.cfg.routes.length; i++) {
+        const route = this.cfg.routes[i];
+        if (!route || this.stopped) return;
+        try {
+          const pipe = await this.handshake(await openRoute(route, this.cfg));
+          this.adopt(pipe, i);
+          return;
+        } catch (err) {
+          errors.push(`${describe(route)}: ${(err as Error).message}`);
+        }
+      }
+      this.linkDown(`no route to the edge (${errors.join('; ')})`);
+    })();
   }
 
-  private handshake(s: Socket): void {
-    this.link = s;
-    s.setNoDelay(true);
-    s.setKeepAlive(true, 15_000);
-    const reader = new FrameReader();
-    const ts = Date.now();
-    const nonce = randomBytes(8).toString('hex');
-    s.write(frame(T_HELLO, Buffer.from(JSON.stringify({ v: TMGW_VERSION, gatewayId: this.cfg.gatewayId, ts, nonce, mac: helloMac(this.cfg.token, this.cfg.gatewayId, ts, nonce) }))));
-    const welcomeTimer = setTimeout(() => s.destroy(new Error('no WELCOME from edge')), 10_000);
-    s.on('data', (chunk) => {
-      try {
-        reader.push(chunk, (type, payload) => {
-          if (this.state === 'connecting') {
+  /**
+   * HELLO on a fresh pipe; resolves once the edge WELCOMEs us. Frames that
+   * arrive after that are handled by adopt().
+   */
+  private handshake(pipe: Pipe): Promise<Pipe> {
+    return new Promise((resolve, reject) => {
+      const reader = new FrameReader();
+      const ts = Date.now();
+      const nonce = randomBytes(8).toString('hex');
+      let done = false;
+      const t = setTimeout(() => finish(new Error('no WELCOME from edge')), 10_000);
+      const finish = (err?: Error) => {
+        if (done) return;
+        done = true;
+        clearTimeout(t);
+        if (err) {
+          pipe.destroy(err);
+          reject(err);
+        } else {
+          resolve(pipe);
+        }
+      };
+      (pipe as Pipe & { reader?: FrameReader }).reader = reader;
+      pipe.onData((chunk) => {
+        if (done) return;
+        try {
+          reader.push(chunk, (type, payload) => {
             if (type === T_WELCOME) {
-              clearTimeout(welcomeTimer);
-              this.state = 'up';
-              this.backoffMs = 1000;
-              this.counters.connects += 1;
-              this.lastFromEdge = Date.now();
               try {
                 this.edgeId = (JSON.parse(payload.toString('utf8')) as { edgeId?: string }).edgeId ?? null;
               } catch {
                 this.edgeId = null;
               }
-              const flushed = this.queue.length;
-              for (const f of this.queue) s.write(f);
-              this.counters.relayed += flushed;
-              this.queue = [];
-              this.log(`link up to edge ${this.edgeId ?? '?'} (${this.cfg.edgeHost}:${this.cfg.edgePort})${flushed ? `, flushed ${flushed} queued datagram(s)` : ''}`);
-              this.sendStats();
-              this.emit('up');
+              finish();
             } else if (type === T_DENY) {
-              clearTimeout(welcomeTimer);
               this.counters.denies += 1;
               // Refused credentials will not fix themselves: back off hard.
               this.backoffMs = 60_000;
-              s.destroy(new Error(`edge refused this gateway: ${payload.toString('utf8')}`));
+              finish(new Error(`edge refused this gateway: ${payload.toString('utf8')}`));
             }
-            return;
-          }
-          this.fromEdge(type, payload);
-        });
+          });
+        } catch (err) {
+          finish(err as Error);
+        }
+      });
+      pipe.onClose((err) => finish(err ?? new Error('closed during handshake')));
+      pipe.write(frame(T_HELLO, Buffer.from(JSON.stringify({ v: TMGW_VERSION, gatewayId: this.cfg.gatewayId, ts, nonce, mac: helloMac(this.cfg.token, this.cfg.gatewayId, ts, nonce) }))));
+    });
+  }
+
+  /** Make a handshaken pipe the live link (replacing any current one). */
+  private adopt(pipe: Pipe, index: number): void {
+    const old = this.link;
+    this.link = pipe;
+    this.routeIndex = index;
+    this.state = 'up';
+    this.backoffMs = 1000;
+    this.counters.connects += 1;
+    this.lastFromEdge = Date.now();
+    const reader = (pipe as Pipe & { reader?: FrameReader }).reader ?? new FrameReader();
+    pipe.onData((chunk) => {
+      if (this.link !== pipe) return;
+      try {
+        reader.push(chunk, (type, payload) => this.fromEdge(type, payload));
       } catch (err) {
-        s.destroy(err as Error);
+        pipe.destroy(err as Error);
       }
     });
-    s.on('error', (e) => { this.counters.lastError = e.message; });
-    s.on('close', () => {
-      clearTimeout(welcomeTimer);
-      if (this.link === s) this.link = null;
-      this.linkDown(this.counters.lastError || 'link closed');
+    pipe.onClose((err) => {
+      if (this.link !== pipe) return;
+      this.link = null;
+      this.linkDown(err?.message ?? this.counters.lastError ?? 'link closed');
     });
+    // The edge has already replaced the old session with this one.
+    old?.destroy();
+    const flushed = this.queue.length;
+    for (const f of this.queue) pipe.write(f);
+    this.counters.relayed += flushed;
+    this.queue = [];
+    const fallback = index > 0 ? ' [fallback]' : '';
+    this.log(`link up to edge ${this.edgeId ?? '?'} via ${describe(pipe.route)}${fallback}${flushed ? `, flushed ${flushed} queued datagram(s)` : ''}`);
+    this.sendStats();
+    this.emit('up');
+    this.scheduleFailback();
+  }
+
+  /** On a fallback route, periodically try the preferred ones again. */
+  private scheduleFailback(): void {
+    if (this.failbackTimer) clearInterval(this.failbackTimer);
+    this.failbackTimer = null;
+    if (this.routeIndex <= 0 || this.cfg.failbackMs <= 0) return;
+    this.failbackTimer = setInterval(() => {
+      void (async () => {
+        for (let i = 0; i < this.routeIndex; i++) {
+          const route = this.cfg.routes[i];
+          if (!route || this.stopped || this.state !== 'up') return;
+          try {
+            const pipe = await this.handshake(await openRoute(route, this.cfg));
+            this.log(`preferred route ${describe(route)} is back; switching`);
+            this.adopt(pipe, i);
+            return;
+          } catch {
+            /* still down; stay on the fallback */
+          }
+        }
+      })();
+    }, this.cfg.failbackMs);
   }
 
   private linkDown(reason: string): void {
     const was = this.state;
     this.state = 'down';
+    this.routeIndex = -1;
     this.counters.lastError = reason;
+    if (this.failbackTimer) clearInterval(this.failbackTimer);
+    this.failbackTimer = null;
     if (was === 'up') this.emit('down');
     if (this.stopped) return;
     this.log(`link down: ${reason}; retrying in ${Math.round(this.backoffMs / 1000)} s`);
@@ -274,7 +344,13 @@ export class Gateway extends EventEmitter {
       gatewayId: this.cfg.gatewayId,
       version: VERSION,
       uptimeS: Math.round((now - this.startedAt) / 1000),
-      link: { state: this.state, edge: `${this.cfg.edgeHost}:${this.cfg.edgePort}`, via: this.cfg.socks5 ? `socks5 ${this.cfg.socks5.host}:${this.cfg.socks5.port}` : 'direct', edgeId: this.edgeId },
+      link: {
+        state: this.state,
+        route: this.link ? describe(this.link.route) : null,
+        fallback: this.routeIndex > 0,
+        routes: this.cfg.routes.map(describe),
+        edgeId: this.edgeId,
+      },
       queue: this.queue.length,
       counters: { ...this.counters },
       nodes: [...this.nodes.values()].map((n) => ({ ...n, ageS: Math.round((now - n.lastSeen) / 1000) })),
@@ -285,7 +361,7 @@ export class Gateway extends EventEmitter {
     if (this.state !== 'up' || !this.link) return;
     const s = this.status();
     const stats = {
-      version: VERSION, uptimeS: s.uptimeS, via: s.link.via, queue: s.queue,
+      version: VERSION, uptimeS: s.uptimeS, route: s.link.route, fallback: s.link.fallback, queue: s.queue,
       nodes: s.nodes.filter((n) => n.ageS < 60).length,
       nodeList: s.nodes.map((n) => ({ uid: n.uid, addr: n.addr, ageS: n.ageS, packets: n.packets })),
       ...this.counters,

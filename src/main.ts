@@ -1,6 +1,7 @@
 /** TMWAccess entry point: `npm start` (reads .env). */
 import { ConfigError, loadConfig } from './config.js';
 import { Gateway, VERSION } from './gateway.js';
+import { describe } from './transport.js';
 
 let cfg;
 try {
@@ -13,7 +14,8 @@ try {
   throw err;
 }
 
-console.log(`[tmwaccess] ${VERSION} gateway "${cfg.gatewayId}" -> edge ${cfg.edgeHost}:${cfg.edgePort}${cfg.socks5 ? ` via SOCKS5 ${cfg.socks5.host}:${cfg.socks5.port}` : ''}`);
+console.log(`[tmwaccess] ${VERSION} gateway "${cfg.gatewayId}" -> routes, in order: ${cfg.routes.map(describe).join(', ')}` +
+  `${cfg.socks5 ? ` (tcp via SOCKS5 ${cfg.socks5.host}:${cfg.socks5.port})` : ''}${cfg.cfAccess ? ' (Cloudflare Access token set)' : ''}`);
 const gw = new Gateway(cfg);
 await gw.start();
 if (cfg.statusPort) console.log(`[tmwaccess] status: http://127.0.0.1:${cfg.statusPort}/`);

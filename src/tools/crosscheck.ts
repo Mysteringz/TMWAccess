@@ -47,7 +47,7 @@ const commands: Buffer[] = [];
 cmd.on('message', (m) => commands.push(m));
 
 const gw = new Gateway({
-  gatewayId: 'crosscheck-gw', edgeHost: '127.0.0.1', edgePort, token: TOKEN, socks5: null,
+  gatewayId: 'crosscheck-gw', routes: [{ kind: 'tcp', host: '127.0.0.1', port: edgePort }], token: TOKEN, socks5: null, cfAccess: null, failbackMs: 0,
   listenHost: '127.0.0.1', listenPort: 0, nodeCommandPort: cmd.address().port, nodeCidrs: ['127.0.0.0/8'], statusPort: 0, queueMax: 100,
 });
 await gw.start();
@@ -81,9 +81,31 @@ const bad = new Gateway({ ...gw.cfg, gatewayId: 'intruder', token: Buffer.from('
 await bad.start();
 await until(() => bad.counters.denies === 1);
 ok('a gateway with the wrong token is refused by TMedge');
-
 await bad.stop();
 await gw.stop();
+
+// The same, over the WebSocket route TMedge serves on the same port (what
+// Cloudflare Tunnel carries), with Access headers as Cloudflare would forward them.
+seen.length = 0;
+const wsgw = new Gateway({
+  ...gw.cfg, gatewayId: 'crosscheck-wss', listenPort: 0,
+  routes: [{ kind: 'wss', url: `ws://127.0.0.1:${edgePort}/tmgw` }],
+  cfAccess: { id: 'test-id.access', secret: 'test-secret' },
+});
+await wsgw.start();
+await until(() => wsgw.linkState() === 'up');
+const info = gws.gateways().find((g: { id: string }) => g.id === 'crosscheck-wss');
+assert.equal(info?.transport, 'websocket');
+ok('TMWAccess connects to the real TMedge over the WebSocket route');
+const wsPort = (wsgw as unknown as { udp: dgram.Socket }).udp.address().port;
+node.send(buildReport({ uid: UID, boot: 4, seq: 0, key: KEY }, 1000, { frame: 1, ta: 30, sceneMin: 22, sceneMax: 31, bgMean: 23, flags: 1, detections: [det] }), wsPort, '127.0.0.1');
+await until(() => seen.length === 1);
+assert.match(seen[0]?.address ?? '', /^gw:crosscheck-wss\|/);
+ok('a signed REPORT relayed over the WebSocket route is accepted by TMedge');
+await ing.sendCommand(UID, CMD_IDENTIFY, 0, 3);
+await until(() => commands.length === 2);
+ok('commands come back over the WebSocket route');
+await wsgw.stop();
 node.close();
 cmd.close();
 await gws.close();

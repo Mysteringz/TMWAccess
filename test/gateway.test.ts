@@ -66,7 +66,7 @@ async function fakeEdge(token = TOKEN, port = 0): Promise<FakeEdge> {
 
 function cfg(edgePort: number, over: Partial<Config> = {}): Config {
   return {
-    gatewayId: 'test-gw', edgeHost: '127.0.0.1', edgePort, token: TOKEN, socks5: null,
+    gatewayId: 'test-gw', routes: [{ kind: 'tcp', host: '127.0.0.1', port: edgePort }], token: TOKEN, socks5: null, cfAccess: null, failbackMs: 0,
     listenHost: '127.0.0.1', listenPort: 0, nodeCommandPort: 0, nodeCidrs: ['127.0.0.0/8'],
     statusPort: 0, queueMax: 100, ...over,
   };
@@ -229,4 +229,44 @@ test('SOCKS5 client: CONNECT through a proxy and carry data', async () => {
     proxy.close();
     target.close();
   }
+});
+
+test('routes: a dead primary falls back to the next route, and the gateway returns to the primary once it answers', async () => {
+  const probe = await fakeEdge();
+  const primaryPort = probe.port;
+  await probe.close();                                   // primary: nothing listening yet
+  const fallback = await fakeEdge();
+  const gw = new Gateway(cfg(0, {
+    routes: [{ kind: 'tcp', host: '127.0.0.1', port: primaryPort }, { kind: 'tcp', host: '127.0.0.1', port: fallback.port }],
+    failbackMs: 300,
+  }));
+  await gw.start();
+  const n = await node(gw);
+  let primary: FakeEdge | null = null;
+  try {
+    await until(() => gw.linkState() === 'up');
+    assert.equal(gw.status().link.fallback, true);
+    n.send(tmPacket(0x01));
+    await until(() => fallback.uplinks.length === 1);
+    primary = await fakeEdge(TOKEN, primaryPort);        // primary comes back
+    await until(() => gw.status().link.fallback === false, 5000);
+    n.send(tmPacket(0x01, '30:ed:a0:cb:f5:f8', Buffer.alloc(14, 7)));
+    await until(() => (primary?.uplinks.length ?? 0) === 1);
+    assert.equal(primary.uplinks[0]?.datagram[22], 7, 'traffic now goes to the primary');
+    assert.equal(fallback.uplinks.length, 1, 'and no longer to the fallback');
+  } finally {
+    n.s.close();
+    await gw.stop();
+    await fallback.close();
+    await primary?.close();
+  }
+});
+
+test('config: routes parse, and a plaintext ws:// to a remote host is refused', async () => {
+  const { parseRoute } = await import('../src/config.js');
+  assert.deepEqual(parseRoute('wss://gw.hkumyseat.com/tmgw'), { kind: 'wss', url: 'wss://gw.hkumyseat.com/tmgw' });
+  assert.deepEqual(parseRoute('tcp://100.106.57.2:5210'), { kind: 'tcp', host: '100.106.57.2', port: 5210 });
+  assert.deepEqual(parseRoute('100.106.57.2:5210'), { kind: 'tcp', host: '100.106.57.2', port: 5210 });
+  assert.throws(() => parseRoute('ws://gw.hkumyseat.com/tmgw'), /use wss/);
+  assert.equal(parseRoute('ws://127.0.0.1:5210/tmgw').kind, 'wss');
 });

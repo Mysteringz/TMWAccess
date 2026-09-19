@@ -21,6 +21,13 @@ TMnodes <--UDP 5201------------- TMWAccess <==commands, same link== TMedge
   and flushes the queue when the link returns. It also treats 45 s of silence
   from the edge as a dead link.
 
+**Routes.** `EDGE` lists routes in order: `wss://gw.hkumyseat.com/tmgw` (WebSocket
+over Cloudflare Tunnel, which needs only outbound HTTPS and carries a Cloudflare
+Access service token) and `tcp://100.106.57.2:5210` (Tailscale). The first
+route that works carries the link. While on a fallback, the preferred route is
+retried every `FAILBACK_S` seconds and taken back as soon as it answers; the
+edge swaps sessions with no gap.
+
 TMLAccess (a LoRa gateway) will use the same link protocol, TMGW, which is
 defined in `TMedge/src/edge/gwlink.ts` and mirrored in `src/gwlink.ts`.
 
@@ -58,6 +65,6 @@ fixed LAN address and re-point the nodes.
 ## Tests
 
 ```sh
-npm test            # 6 claims, against a fake edge
-npm run crosscheck  # against the real TMedge (../TMedge, built): auth, relay, forged packet, commands
+npm test            # 8 claims, against a fake edge (incl. failover and failback)
+npm run crosscheck  # against the real TMedge (../TMedge, built), over TCP and WebSocket: auth, relay, forged packet, commands
 ```
