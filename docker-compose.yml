@@ -1,0 +1,26 @@
+# TMWAccess on any Docker host at a site with TMnodes.
+#
+#   cp .env.example .env          # GATEWAY_ID, EDGE routes, TMGW_TOKEN, CF_ACCESS_* (see DOCKER.md)
+#   docker compose up -d --build
+#   docker compose logs -f
+#
+# Host networking (Linux): the gateway must see each node's real LAN address
+# -- it relays only from NODE_CIDRS and sends commands back to that address --
+# and Docker's bridge NAT can hide it. The gateway opens no inbound port other
+# than UDP 5200 for the nodes; its link to TMedge is outbound only.
+
+services:
+  tmwaccess:
+    build: .
+    image: tmwaccess:1.0
+    restart: unless-stopped
+    env_file: .env
+    network_mode: host
+    # Docker Desktop (macOS/Windows) without host networking: remove
+    # network_mode above and publish the node port instead. Uplink then works,
+    # but every node appears to come from Docker's NAT address (e.g.
+    # 172.17.0.1), so widen NODE_CIDRS to include it, and commands from the
+    # console (identify, reboot, ...) cannot reach the nodes. Use it for
+    # testing; run sites on Linux with host networking.
+    # ports:
+    #   - "5200:5200/udp"

@@ -44,6 +44,9 @@ curl -s 127.0.0.1:5280/   # status: link state, nodes seen, counters
 - **macOS (dev launchpad):** `deploy/install-macos.sh` installs launchd agents
   for TMWAccess and, on a Mac whose VPN blocks the tailnet, a userspace
   Tailscale client that TMWAccess tunnels through (`SOCKS5=127.0.0.1:1055`).
+- **Docker (any Linux host, amd64 or arm64):** `docker compose up -d --build`.
+  It uses host networking so the gateway sees the nodes' real addresses. See
+  **[DOCKER.md](DOCKER.md)** for installation and how the relay works.
 - **Ubuntu (permanent mini PC):** `deploy/install-ubuntu.sh` installs to
   `/opt/tmwaccess` with a systemd unit (`tmwaccess`). With kernel Tailscale on
   the mini PC, leave `SOCKS5` unset.
