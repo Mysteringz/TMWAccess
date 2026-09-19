@@ -49,6 +49,12 @@ export class Gateway extends EventEmitter {
   private link: Pipe | null = null;
   private routeIndex = -1;
   private failbackTimer: NodeJS.Timeout | null = null;
+  /**
+   * Set while taking back the preferred route. The edge replaces our session
+   * as soon as the new one says HELLO, which closes the old pipe a moment
+   * before adopt() runs; that close is expected, not a failure.
+   */
+  private switching = false;
   private state: LinkState = 'down';
   private edgeId: string | null = null;
   private queue: Buffer[] = [];
@@ -270,7 +276,7 @@ export class Gateway extends EventEmitter {
       }
     });
     pipe.onClose((err) => {
-      if (this.link !== pipe) return;
+      if (this.link !== pipe || this.switching) return;
       this.link = null;
       this.linkDown(err?.message ?? this.counters.lastError ?? 'link closed');
     });
@@ -297,6 +303,7 @@ export class Gateway extends EventEmitter {
         for (let i = 0; i < this.routeIndex; i++) {
           const route = this.cfg.routes[i];
           if (!route || this.stopped || this.state !== 'up') return;
+          this.switching = true;
           try {
             const pipe = await this.handshake(await openRoute(route, this.cfg));
             this.log(`preferred route ${describe(route)} is back; switching`);
@@ -304,6 +311,8 @@ export class Gateway extends EventEmitter {
             return;
           } catch {
             /* still down; stay on the fallback */
+          } finally {
+            this.switching = false;
           }
         }
       })();

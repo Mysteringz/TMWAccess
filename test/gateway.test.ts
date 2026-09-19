@@ -248,8 +248,16 @@ test('routes: a dead primary falls back to the next route, and the gateway retur
     assert.equal(gw.status().link.fallback, true);
     n.send(tmPacket(0x01));
     await until(() => fallback.uplinks.length === 1);
+    // Like TMedge, the fake edge drops the old session when the same gateway says HELLO again.
+    fallback.sockets.forEach((s) => s.on('close', () => undefined));
+    const downs: string[] = [];
+    gw.on('down', () => downs.push('down'));
     primary = await fakeEdge(TOKEN, primaryPort);        // primary comes back
     await until(() => gw.status().link.fallback === false, 5000);
+    fallback.sockets.forEach((s) => s.destroy());        // the edge closing the replaced session
+    await new Promise((r) => setTimeout(r, 200));
+    assert.equal(gw.linkState(), 'up');
+    assert.deepEqual(downs, [], 'switching routes is not a link failure');
     n.send(tmPacket(0x01, '30:ed:a0:cb:f5:f8', Buffer.alloc(14, 7)));
     await until(() => (primary?.uplinks.length ?? 0) === 1);
     assert.equal(primary.uplinks[0]?.datagram[22], 7, 'traffic now goes to the primary');
