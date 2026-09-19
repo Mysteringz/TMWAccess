@@ -1,7 +1,7 @@
 # TMWAccess — notes for AI coding sessions
 
 Wi-Fi access gateway: TMnode UDP → one outbound TMGW link → TMedge. Pairs with
-`../TMedge` (edge) and `../TMnode` (firmware).
+`../TMedge` (edge) and `../TMsense` (firmware, formerly TMnode).
 
 - `src/gwlink.ts` mirrors `TMedge/src/edge/gwlink.ts` (the source of truth). Change both
   together, then run `npm run crosscheck` (it drives TMedge's real server).
