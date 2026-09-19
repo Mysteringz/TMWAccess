@@ -1,0 +1,20 @@
+# systemd unit for Ubuntu (the permanent mini PC). Installed by deploy/install-ubuntu.sh.
+[Unit]
+Description=TMWAccess: Wi-Fi access gateway for TMnodes -> TMedge
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+User=tmwaccess
+Group=tmwaccess
+WorkingDirectory=/opt/tmwaccess
+ExecStart=/usr/local/bin/node --env-file=/opt/tmwaccess/.env dist/src/main.js
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

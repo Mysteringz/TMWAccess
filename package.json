@@ -1,0 +1,19 @@
+{
+  "name": "tmwaccess",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TMWAccess: Wi-Fi access gateway that relays TMnode packets to TMedge over one outbound authenticated link",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsc -p tsconfig.json && node --test dist/test/",
+    "crosscheck": "tsc -p tsconfig.json && node dist/src/tools/crosscheck.js",
+    "start": "node --env-file-if-exists=.env dist/src/main.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2"
+  }
+}
