@@ -22,6 +22,8 @@ export interface Config {
   /** Only datagrams from these networks are relayed (the site's LAN). */
   nodeCidrs: string[];
   statusPort: number;
+  /** Where nodes fetch a firmware image from this gateway (0 = updates off). */
+  imagePort: number;
   queueMax: number;
 }
 
@@ -82,6 +84,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     nodeCommandPort: int(env, 'NODE_COMMAND_PORT', 5201, 1, 65535),
     nodeCidrs: (env.NODE_CIDRS ?? '10.0.0.0/8,172.16.0.0/12,192.168.0.0/16').split(',').map((s) => s.trim()).filter(Boolean),
     statusPort: int(env, 'STATUS_PORT', 5280, 0, 65535),
+    imagePort: int(env, 'IMAGE_PORT', 5282, 0, 65535),
     queueMax: int(env, 'QUEUE_MAX', 5000, 10, 1_000_000),
   };
 }

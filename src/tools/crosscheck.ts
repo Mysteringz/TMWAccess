@@ -48,7 +48,7 @@ cmd.on('message', (m) => commands.push(m));
 
 const gw = new Gateway({
   gatewayId: 'crosscheck-gw', routes: [{ kind: 'tcp', host: '127.0.0.1', port: edgePort }], token: TOKEN, socks5: null, cfAccess: null, failbackMs: 0,
-  listenHost: '127.0.0.1', listenPort: 0, nodeCommandPort: cmd.address().port, nodeCidrs: ['127.0.0.0/8'], statusPort: 0, queueMax: 100,
+  listenHost: '127.0.0.1', listenPort: 0, nodeCommandPort: cmd.address().port, nodeCidrs: ['127.0.0.0/8'], statusPort: 0, imagePort: 0, queueMax: 100,
 });
 await gw.start();
 await until(() => gw.linkState() === 'up');

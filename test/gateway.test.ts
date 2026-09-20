@@ -67,7 +67,7 @@ async function fakeEdge(token = TOKEN, port = 0): Promise<FakeEdge> {
 function cfg(edgePort: number, over: Partial<Config> = {}): Config {
   return {
     gatewayId: 'test-gw', routes: [{ kind: 'tcp', host: '127.0.0.1', port: edgePort }], token: TOKEN, socks5: null, cfAccess: null, failbackMs: 0,
-    listenHost: '127.0.0.1', listenPort: 0, nodeCommandPort: 0, nodeCidrs: ['127.0.0.0/8'],
+    listenHost: '127.0.0.1', listenPort: 0, nodeCommandPort: 0, nodeCidrs: ['127.0.0.0/8'], imagePort: 0,
     statusPort: 0, queueMax: 100, ...over,
   };
 }

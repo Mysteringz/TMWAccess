@@ -74,6 +74,17 @@ reboot
 Above M3 (`30:ed:a0:cb:f5:f8`) is set to `192.168.0.43`, the NUC, and that
 setting is saved in the node's flash.
 
+## Firmware images
+
+TMedge pushes a firmware image down the same link in 32 kB frames; the gateway
+holds it in memory, checks it against the SHA-256 the edge announced, and
+serves it at `http://<gateway>:5282/fw/<id>.bin` to the node network only
+(`NODE_CIDRS`, same rule as the uplink). `IMAGE_PORT=0` turns that off.
+
+The gateway is deliberately not trusted with what it serves: the node checks
+the bytes against the hash in the signed request TMedge sent it, so a wrong
+or altered image is refused by the node rather than booted.
+
 ## Tests
 
 ```sh

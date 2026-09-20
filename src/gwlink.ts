@@ -16,6 +16,10 @@ export const T_DOWNLINK = 0x20;
 export const T_PING = 0x30;
 export const T_PONG = 0x31;
 export const T_STATS = 0x40;
+/** Firmware images on their way to a gateway, for an over-the-air update. */
+export const T_IMAGE_META = 0x50;
+export const T_IMAGE_CHUNK = 0x51;
+export const T_IMAGE_READY = 0x52;
 export const MAX_FRAME = 64 * 1024;
 
 export function frame(type: number, payload: Buffer): Buffer {
@@ -65,8 +69,11 @@ export class FrameReader {
 
 // --- TMnode datagram sanity (the gateway never verifies HMAC: it has no key) ---
 
-export const TM_UPLINK_TYPES = new Set([0x01, 0x02, 0x03]);
+export const TM_UPLINK_TYPES = new Set([0x01, 0x02, 0x03, 0x04]);   // report, raw, status, ota progress
 export const TM_COMMAND = 0x10;
+export const TM_OTA = 0x11;
+/** The only things a gateway may put back on the node network. */
+export const TM_DOWNLINK_TYPES = new Set([TM_COMMAND, TM_OTA]);
 export const TM_HEADER = 22;
 export const TM_TAG = 8;
 

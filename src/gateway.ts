@@ -22,8 +22,10 @@ import { randomBytes } from 'node:crypto';
 import type { Config } from './config.js';
 import {
   addressed, frame, FrameReader, helloMac, parseAddressed, tmShape,
-  T_DENY, T_DOWNLINK, T_HELLO, T_PING, T_PONG, T_STATS, T_UPLINK, T_WELCOME, TM_COMMAND, TM_UPLINK_TYPES, TMGW_VERSION,
+  T_DENY, T_DOWNLINK, T_HELLO, T_IMAGE_CHUNK, T_IMAGE_META, T_IMAGE_READY, T_PING, T_PONG, T_STATS, T_UPLINK, T_WELCOME,
+  TM_DOWNLINK_TYPES, TM_UPLINK_TYPES, TMGW_VERSION,
 } from './gwlink.js';
+import { ImageStore } from './images.js';
 import { describe, openRoute, type Pipe } from './transport.js';
 
 export const VERSION = '1.0.0';
@@ -46,6 +48,7 @@ export class Gateway extends EventEmitter {
   readonly nodes = new Map<string, NodeSeen>();
   private readonly udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
   private readonly allow = new BlockList();
+  private readonly images = new ImageStore(this.allow, (m) => this.log(m));
   private link: Pipe | null = null;
   private routeIndex = -1;
   private failbackTimer: NodeJS.Timeout | null = null;
@@ -90,6 +93,20 @@ export class Gateway extends EventEmitter {
     this.timers.push(setInterval(() => this.heartbeat(), 15_000));
     this.timers.push(setInterval(() => this.sendStats(), 10_000));
     if (this.cfg.statusPort > 0) this.startStatus();
+    if (this.cfg.imagePort > 0) {
+      // Firmware images are served on the node network, the one network the
+      // nodes can reach; the same CIDR rule as the uplink applies.
+      await this.images.listen(this.cfg.imagePort, this.cfg.listenHost);
+      this.log(`firmware images on http://${this.cfg.listenHost}:${this.cfg.imagePort}/fw/<id>.bin`);
+    }
+  }
+
+  /** Tell the edge whether an image arrived intact. */
+  private sendImageResult(id: string, ok: boolean, error?: string): void {
+    if (!ok) this.log(`image rejected: ${error ?? 'unknown'}`);
+    this.link?.write(frame(T_IMAGE_READY, Buffer.from(JSON.stringify({
+      id, ok, error, port: this.cfg.imagePort,
+    }))));
   }
 
   async stop(): Promise<void> {
@@ -164,7 +181,7 @@ export class Gateway extends EventEmitter {
         // Only a TM COMMAND, only to a node this gateway has heard from, at the
         // address it was heard from: the gateway must not become a relay into
         // the LAN for anything the edge (or someone on the link) asks.
-        if (!d || !shape || shape.type !== TM_COMMAND || !node || node.addr !== d.addr) {
+        if (!d || !shape || !TM_DOWNLINK_TYPES.has(shape.type) || !node || node.addr !== d.addr) {
           this.counters.commandsRefused += 1;
           return;
         }
@@ -174,6 +191,32 @@ export class Gateway extends EventEmitter {
         node.commands += 1;
         this.counters.commandsSent += 1;
         this.log(`command for ${node.uid} delivered to ${node.addr}:${this.cfg.nodeCommandPort}`);
+        return;
+      }
+      // A firmware image, in pieces. The gateway only holds and serves it;
+      // whether it is the right image is settled by the node, against the
+      // hash in the signed request the edge sent it.
+      case T_IMAGE_META: {
+        try {
+          const meta = JSON.parse(payload.toString('utf8')) as { id: string; size: number; sha256: string };
+          this.images.begin(meta);
+        } catch (err) {
+          this.sendImageResult('', false, (err as Error).message);
+        }
+        return;
+      }
+      case T_IMAGE_CHUNK: {
+        // [idLen u8][id][offset u32][bytes]
+        try {
+          const idLen = payload[0] ?? 0;
+          const id = payload.subarray(1, 1 + idLen).toString('latin1');
+          const offset = payload.readUInt32LE(1 + idLen);
+          const bytes = payload.subarray(1 + idLen + 4);
+          const done = this.images.chunk(id, offset, bytes);
+          if (done) this.sendImageResult(done.id, true);
+        } catch (err) {
+          this.sendImageResult('', false, (err as Error).message);
+        }
         return;
       }
       case T_PING:
