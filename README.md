@@ -91,3 +91,12 @@ or altered image is refused by the node rather than booted.
 npm test            # 8 claims, against a fake edge (incl. failover and failback)
 npm run crosscheck  # against the real TMedge (../TMedge, built), over TCP and WebSocket: auth, relay, forged packet, commands
 ```
+
+## Continuous integration
+
+CI runs typecheck, unit tests and builds on Linux and macOS using Node 22.
+TMedge CI additionally checks the pinned gateway against its real TCP and
+WebSocket server. Gateway deployment remains an explicit site operation.
+
+Default-branch changes go through a pull request with required checks.
+GitHub Actions dependencies are pinned and updated through Dependabot PRs.
