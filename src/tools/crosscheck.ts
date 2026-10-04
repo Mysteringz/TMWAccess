@@ -6,6 +6,9 @@
  */
 import assert from 'node:assert/strict';
 import dgram from 'node:dgram';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Gateway } from '../gateway.js';
@@ -106,6 +109,53 @@ await ing.sendCommand(UID, CMD_IDENTIFY, 0, 3);
 await until(() => commands.length === 2);
 ok('commands come back over the WebSocket route');
 await wsgw.stop();
+
+// Wire v2 uses the real firmware builder/parser at both ends. The gateway has
+// no device keys; exercise durable admission, REPORT ACK and COMMAND over both
+// link types, with no plaintext exposed on the gateway link.
+const { DeviceKeys } = await imp('secure.js');
+const firmware = resolve(process.env.TMSENSE_DIR ?? resolve(dir, '../TMsense'));
+const harness = execFileSync(resolve(firmware, 'test/host/build_packet_host.sh'), [resolve('dist/packet_host')], { encoding: 'utf8' }).trim();
+const fixtures = execFileSync(harness, ['emit-secure'], { encoding: 'utf8' }).trim().split('\n').map((line) => JSON.parse(line) as { name: string; hex: string });
+const encryptedReport = Buffer.from(fixtures.find(f => f.name === 'report_empty')!.hex, 'hex');
+const encryptedUid = [...encryptedReport.subarray(4, 10)].map(b => b.toString(16).padStart(2, '0')).join(':');
+for (const transport of ['tcp', 'wss'] as const) {
+  const temp = mkdtempSync(resolve(tmpdir(), 'gateway-encrypted-'));
+  let secureGws: InstanceType<typeof GatewayServer>;
+  const devices = new DeviceKeys({ version: 2, nodes: { [encryptedUid]: { current: { id: 7, secret: '11'.repeat(32) } } } });
+  const secureIngest = new Ingest({ port: 0, host: '127.0.0.1', verify: { keys: [], allowUnsigned: false, devices }, commandKey: null,
+    cursorPath: resolve(temp, 'replay.jsonl'), routeViaGateway: (a: string, b: Buffer) => secureGws.sendDownlink(a, b) });
+  let accepted = 0, denied = 0;
+  secureIngest.on('report', () => accepted++); secureIngest.on('rejected', () => denied++);
+  secureGws = new GatewayServer({ port: 0, host: '127.0.0.1', token: TOKEN, edgeId: 'encrypted-edge', allowRawTcp: true,
+    onUplink: (d: Buffer, a: string) => { void secureIngest.handleDurable(d, a); } });
+  const securePort: number = await secureGws.listen();
+  const secureGw = new Gateway({ ...gw.cfg, gatewayId: `encrypted-${transport}`, listenPort: 0,
+    routes: transport === 'tcp' ? [{ kind: 'tcp', host: '127.0.0.1', port: securePort }] : [{ kind: 'wss', url: `ws://127.0.0.1:${securePort}/tmgw` }] });
+  try {
+    await secureGw.start(); await until(() => secureGw.linkState() === 'up');
+    const port = (secureGw as unknown as { udp: dgram.Socket }).udp.address().port;
+    const start = commands.length;
+    node.send(encryptedReport, port, '127.0.0.1');
+    await until(() => accepted === 1 && commands.length === start + 1);
+    const ack = commands[start]!;
+    assert.equal(ack[2], 2); assert.equal(ack[3], 0x12);
+    const parsedAck = JSON.parse(execFileSync(harness, ['parse-ack', ack.toString('hex'), 'secure'], { encoding: 'utf8' })) as { result: number; type: number };
+    assert.equal(parsedAck.result, 0); assert.equal(parsedAck.type, 1);
+    ok(`encrypted firmware REPORT crosses ${transport} gateway and its durable ACK authenticates in real firmware`);
+    await secureIngest.sendCommand(encryptedUid, CMD_IDENTIFY, 0, 3);
+    await until(() => commands.length === start + 2);
+    const parsedCmd = JSON.parse(execFileSync(harness, ['parse', commands[start + 1]!.toString('hex'), 'secure'], { encoding: 'utf8' })) as { result: number; opcode: number };
+    assert.equal(parsedCmd.result, 0); assert.equal(parsedCmd.opcode, CMD_IDENTIFY);
+    ok(`encrypted COMMAND crosses ${transport} gateway and authenticates in real firmware`);
+    node.send(encryptedReport, port, '127.0.0.1');
+    const altered = Buffer.from(encryptedReport); altered[altered.length - 1]! ^= 1;
+    node.send(altered, port, '127.0.0.1');
+    await until(() => denied === 2); await new Promise(r => setTimeout(r, 50));
+    assert.equal(accepted, 1); assert.equal(commands.length, start + 2);
+    ok(`${transport} relay replay and tag alteration produce no application event or ACK`);
+  } finally { await secureGw.stop(); await secureIngest.stop(); await secureGws.close(); rmSync(temp, { recursive: true, force: true }); }
+}
 node.close();
 cmd.close();
 await gws.close();

@@ -26,7 +26,7 @@ WORKDIR /app
 COPY --from=build /src/dist/src ./dist/src
 COPY package.json ./
 USER node
-EXPOSE 5200/udp
+EXPOSE 5200/udp 5282/tcp
 # Healthy = the gateway answers on its status port and its link to TMedge is up.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["node", "-e", \
   "fetch('http://127.0.0.1:'+(process.env.STATUS_PORT||5280)+'/').then(r=>r.json()).then(s=>process.exit(s.link.state==='up'?0:1)).catch(()=>process.exit(1))"]

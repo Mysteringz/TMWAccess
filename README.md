@@ -1,5 +1,11 @@
 # TMWAccess
 
+Wire v2 relays encrypted TMsense 1.7 packets and accepted-report ACKs without
+sensor keys. See the paired [protocol and migration runbook](https://github.com/Mysteringz/TMedge/blob/main/docs/ENCRYPTED_NODE_PROTOCOL.md).
+Use a per-gateway credential from TMedge's `TMGW_KEYS_FILE` and WSS for public
+routes. Non-loopback raw TCP requires `TCP_ENCRYPTED=1` and an existing encrypted
+authenticated network; TMedge separately defaults raw TCP off.
+
 **Wi-Fi access gateway for TMnodes.** TMnodes on a site's Wi-Fi send their
 packets to TMWAccess, which relays them to **TMedge** over one outbound,
 authenticated TCP link. Commands from TMedge come back the same way.
@@ -12,9 +18,9 @@ TMnodes <--UDP 5201------------- TMWAccess <==commands, same link== TMedge
 - **Outbound only.** The site needs no inbound port, so it works behind NAT, on
   a campus network, or through a SOCKS5 proxy.
 - **Holds no node keys.** It checks that a datagram looks like a TMnode
-  packet and relays it byte for byte. TMedge verifies each node's HMAC, so a
+  packet and relays it byte for byte. TMedge verifies each node's HMAC or AEAD tag, so a
   compromised gateway can't forge occupancy.
-- **Not an open relay.** It sends only TMnode COMMANDs, only to nodes it has
+- **Not an open relay.** It sends only TMnode commands, OTA requests and encrypted ACKs, only to nodes it has
   heard from, and only at the address it heard them from.
 - **Survives outages.** While the edge is unreachable it queues up to
   `QUEUE_MAX` datagrams (dropping the oldest first), reconnects with backoff,
@@ -76,6 +82,14 @@ reboot
 Use your gateway's reserved LAN address. `save` persists that setting in the
 node's flash.
 
+The gateway keeps at most 512 recently heard identities, expires return routes after
+five minutes, and includes at most 128 entries in each diagnostic STATS frame.
+Deploy one gateway per site segment if the segment exceeds that capacity.
+
+Raw `tcp://` routes require an authenticated encrypted network such as Tailscale.
+The TMGW token authenticates the handshake; TCP itself does not encrypt traffic
+or authenticate the server. Use `wss://` for routes over other networks.
+
 ## Firmware images
 
 TMedge pushes a firmware image down the same link in 32 kB frames; the gateway
@@ -90,7 +104,7 @@ or altered image is refused by the node rather than booted.
 ## Tests
 
 ```sh
-npm test            # 8 claims, against a fake edge (incl. failover and failback)
+npm test            # regression claims, against a fake edge (incl. failover and failback)
 npm run crosscheck  # against the real TMedge (../TMedge, built), over TCP and WebSocket: auth, relay, forged packet, commands
 ```
 
