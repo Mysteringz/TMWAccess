@@ -136,22 +136,23 @@ test('edge-approved node addresses survive spoofed address-candidate floods', as
   await new Promise<void>(r => cmdSock.bind(0, '127.0.0.1', r));
   const got: Buffer[] = []; cmdSock.on('message', b => got.push(b));
   const gw = new Gateway(cfg(edge.port, { nodeCommandPort: cmdSock.address().port }));
-  const spoofers: dgram.Socket[] = [];
   await gw.start(); const n = await node(gw);
   try {
     await until(() => gw.linkState() === 'up'); n.send(tmPacket(1));
     await until(() => edge.uplinks.length === 1);
     edge.sendDown('127.0.0.1', n.port, tmPacket(0x10)); await until(() => got.length === 1);
+    // macOS does not automatically bind every address in 127/8. Inject the
+    // candidate datagrams into the same source/shape admission callback while
+    // retaining real UDP traffic and the authenticated edge downlink above.
+    const receiver = gw as unknown as { fromNode(msg: Buffer, addr: string, port: number): void };
     for (let i = 2; i <= 12; i++) {
-      const s = dgram.createSocket('udp4'); spoofers.push(s);
-      await new Promise<void>(r => s.bind(0, `127.0.0.${i}`, r));
-      s.send(tmPacket(1), (gw as unknown as { udp: dgram.Socket }).udp.address().port, '127.0.0.1');
+      receiver.fromNode(tmPacket(1), `127.0.0.${i}`, n.port);
     }
     await until(() => edge.uplinks.length === 12);
     assert.equal(gw.nodes.get('30:ed:a0:cb:f5:f8')?.addr, '127.0.0.1');
     edge.sendDown('127.0.0.1', n.port, tmPacket(0x10)); await until(() => got.length === 2);
     assert.equal(gw.counters.commandsRefused, 0);
-  } finally { spoofers.forEach(s => s.close()); n.s.close(); cmdSock.close(); await gw.stop(); await edge.close(); }
+  } finally { n.s.close(); cmdSock.close(); await gw.stop(); await edge.close(); }
 });
 
 test('while the edge is unreachable packets queue (bounded), and flush when the link comes up', async () => {
