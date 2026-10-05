@@ -313,20 +313,19 @@ test('a forged uplink from another LAN address does not overwrite the signed ret
   const gw = new Gateway(cfg(edge.port, { nodeCommandPort: cmdSock.address().port }));
   await gw.start();
   const real = await node(gw);
-  const forged = dgram.createSocket('udp4');
-  await new Promise<void>((r) => forged.bind(0, '127.0.0.2', () => r()));
   try {
     await until(() => gw.linkState() === 'up');
     real.send(tmPacket(0x01));
     await until(() => edge.uplinks.length === 1);
-    forged.send(tmPacket(0x01), (gw as unknown as { udp: dgram.Socket }).udp.address().port, '127.0.0.1');
+    // Exercise the datagram callback without depending on macOS loopback aliases.
+    (gw as unknown as { fromNode(msg: Buffer, addr: string, port: number): void }).fromNode(tmPacket(0x01), '127.0.0.2', real.port);
     await until(() => edge.uplinks.length === 2);
     // The real edge rejects the forged signature and retains the first route.
     edge.sendDown('127.0.0.1', real.port, tmPacket(0x10));
     await until(() => commands.length === 1);
     assert.equal(gw.counters.commandsRefused, 0);
   } finally {
-    real.s.close(); forged.close(); cmdSock.close(); await gw.stop(); await edge.close();
+    real.s.close(); cmdSock.close(); await gw.stop(); await edge.close();
   }
 });
 
