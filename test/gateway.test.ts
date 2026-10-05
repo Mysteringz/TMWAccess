@@ -9,7 +9,7 @@ import { connect, createServer, type AddressInfo, type Socket } from 'node:net';
 import { test } from 'node:test';
 import type { Config } from '../src/config.js';
 import { Gateway } from '../src/gateway.js';
-import { addressed, frame, FrameReader, helloMac, parseAddressed, T_DOWNLINK, T_HELLO, T_UPLINK, T_WELCOME, T_DENY } from '../src/gwlink.js';
+import { addressed, frame, FrameReader, helloMac, parseAddressed, T_DOWNLINK, T_HELLO, T_UPLINK, T_WELCOME, T_DENY, T_IMAGE_META, T_IMAGE_CHUNK } from '../src/gwlink.js';
 import { socks5Connect } from '../src/socks5.js';
 
 const TOKEN = Buffer.from('gateway-token-for-tests');
@@ -128,6 +128,31 @@ test('only nodes on the configured networks are relayed', async () => {
     await gw.stop();
     await edge.close();
   }
+});
+
+test('edge-approved node addresses survive spoofed address-candidate floods', async () => {
+  const edge = await fakeEdge();
+  const cmdSock = dgram.createSocket('udp4');
+  await new Promise<void>(r => cmdSock.bind(0, '127.0.0.1', r));
+  const got: Buffer[] = []; cmdSock.on('message', b => got.push(b));
+  const gw = new Gateway(cfg(edge.port, { nodeCommandPort: cmdSock.address().port }));
+  await gw.start(); const n = await node(gw);
+  try {
+    await until(() => gw.linkState() === 'up'); n.send(tmPacket(1));
+    await until(() => edge.uplinks.length === 1);
+    edge.sendDown('127.0.0.1', n.port, tmPacket(0x10)); await until(() => got.length === 1);
+    // macOS does not automatically bind every address in 127/8. Inject the
+    // candidate datagrams into the same source/shape admission callback while
+    // retaining real UDP traffic and the authenticated edge downlink above.
+    const receiver = gw as unknown as { fromNode(msg: Buffer, addr: string, port: number): void };
+    for (let i = 2; i <= 12; i++) {
+      receiver.fromNode(tmPacket(1), `127.0.0.${i}`, n.port);
+    }
+    await until(() => edge.uplinks.length === 12);
+    assert.equal(gw.nodes.get('30:ed:a0:cb:f5:f8')?.addr, '127.0.0.1');
+    edge.sendDown('127.0.0.1', n.port, tmPacket(0x10)); await until(() => got.length === 2);
+    assert.equal(gw.counters.commandsRefused, 0);
+  } finally { n.s.close(); cmdSock.close(); await gw.stop(); await edge.close(); }
 });
 
 test('while the edge is unreachable packets queue (bounded), and flush when the link comes up', async () => {
@@ -277,4 +302,153 @@ test('config: routes parse, and a plaintext ws:// to a remote host is refused', 
   assert.deepEqual(parseRoute('100.106.57.2:5210'), { kind: 'tcp', host: '100.106.57.2', port: 5210 });
   assert.throws(() => parseRoute('ws://gw.hkumyseat.com/tmgw'), /use wss/);
   assert.equal(parseRoute('ws://127.0.0.1:5210/tmgw').kind, 'wss');
+});
+
+test('a forged uplink from another LAN address does not overwrite the signed return route', async () => {
+  const edge = await fakeEdge();
+  const cmdSock = dgram.createSocket('udp4');
+  await new Promise<void>((r) => cmdSock.bind(0, '127.0.0.1', () => r()));
+  const commands: Buffer[] = [];
+  cmdSock.on('message', (m) => commands.push(m));
+  const gw = new Gateway(cfg(edge.port, { nodeCommandPort: cmdSock.address().port }));
+  await gw.start();
+  const real = await node(gw);
+  try {
+    await until(() => gw.linkState() === 'up');
+    real.send(tmPacket(0x01));
+    await until(() => edge.uplinks.length === 1);
+    // Exercise the datagram callback without depending on macOS loopback aliases.
+    (gw as unknown as { fromNode(msg: Buffer, addr: string, port: number): void }).fromNode(tmPacket(0x01), '127.0.0.2', real.port);
+    await until(() => edge.uplinks.length === 2);
+    // The real edge rejects the forged signature and retains the first route.
+    edge.sendDown('127.0.0.1', real.port, tmPacket(0x10));
+    await until(() => commands.length === 1);
+    assert.equal(gw.counters.commandsRefused, 0);
+  } finally {
+    real.s.close(); cmdSock.close(); await gw.stop(); await edge.close();
+  }
+});
+
+test('node identities, old return routes and the STATS frame stay bounded under LAN floods', async () => {
+  const gw = new Gateway(cfg(1));
+  const internals = gw as unknown as { fromNode(b: Buffer, addr: string, port: number): void; pruneNodes(now: number): void; log(msg: string): void; sendStats(): void; state: string; link: { route: Config['routes'][number]; write(b: Buffer): void }; };
+  internals.log = () => undefined;
+  for (let i = 0; i < 600; i++) {
+    const uid = `02:00:00:00:${(i >> 8).toString(16).padStart(2, '0')}:${(i & 255).toString(16).padStart(2, '0')}`;
+    internals.fromNode(tmPacket(0x01, uid), '127.0.0.1', 5200);
+  }
+  assert.equal(gw.nodes.size, 512);
+  const frames: Buffer[] = [];
+  internals.state = 'up';
+  internals.link = { route: gw.cfg.routes[0]!, write: (b) => frames.push(b) };
+  internals.sendStats();
+  assert.ok(frames[0] && frames[0].length < 64 * 1024);
+  internals.pruneNodes(Date.now() + 5 * 60_000 + 1);
+  assert.equal(gw.nodes.size, 0);
+});
+
+test('WELCOME and firmware frames in one TCP read are all processed', async () => {
+  const { createHash } = await import('node:crypto');
+  const bytes = Buffer.alloc(100, 0x3a);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const id = sha256.slice(0, 16);
+  const sockets: Socket[] = [];
+  const server = createServer((sock) => {
+    sockets.push(sock);
+    sock.once('data', () => {
+      const head = Buffer.alloc(1 + id.length + 4);
+      head[0] = id.length;
+      head.write(id, 1, 'latin1');
+      sock.write(Buffer.concat([
+        frame(T_WELCOME, Buffer.from('{"v":1,"edgeId":"fake"}')),
+        frame(T_IMAGE_META, Buffer.from(JSON.stringify({ id, size: bytes.length, sha256 }))),
+        frame(T_IMAGE_CHUNK, Buffer.concat([head, bytes])),
+      ]));
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const gw = new Gateway(cfg((server.address() as AddressInfo).port));
+  try {
+    await gw.start();
+    await until(() => gw.linkState() === 'up');
+    assert.equal((gw as unknown as { images: { has(id: string): boolean } }).images.has(id), true);
+  } finally {
+    await gw.stop(); sockets.forEach((s) => s.destroy()); await new Promise<void>((r) => server.close(() => r()));
+  }
+});
+
+test('stop closes the firmware HTTP listener and is idempotent', async () => {
+  const edge = await fakeEdge();
+  const probe = await fakeEdge();
+  const imagePort = probe.port;
+  await probe.close();
+  const gw = new Gateway(cfg(edge.port, { imagePort }));
+  try {
+    await gw.start();
+    await until(() => gw.linkState() === 'up');
+    assert.equal((await fetch(`http://127.0.0.1:${imagePort}/missing`)).status, 404);
+    await gw.stop();
+    await gw.stop();
+    await assert.rejects(fetch(`http://127.0.0.1:${imagePort}/missing`, { signal: AbortSignal.timeout(1000) }));
+  } finally { await gw.stop(); await edge.close(); }
+});
+
+test('startup reports an occupied UDP port instead of hanging', async () => {
+  const occupied = dgram.createSocket('udp4');
+  await new Promise<void>((r) => occupied.bind(0, '127.0.0.1', () => r()));
+  const gw = new Gateway(cfg(1, { listenPort: occupied.address().port }));
+  try { await assert.rejects(gw.start(), /EADDRINUSE/); }
+  finally { await gw.stop(); occupied.close(); }
+});
+
+test('SOCKS5 rejects malformed replies and early close promptly', async () => {
+  for (const reply of [Buffer.from([4, 0, 0, 1, 127, 0, 0, 1, 0, 0]), Buffer.from([5, 0, 0, 99, 0, 0, 0]), null]) {
+    const sockets: Socket[] = [];
+    const proxy = createServer((s) => {
+      sockets.push(s);
+      let stage = 0;
+      s.on('data', () => {
+        if (stage++ === 0) s.write(Buffer.from([5, 0]));
+        else if (reply) s.write(reply);
+        else s.end();
+      });
+    });
+    await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', () => r()));
+    try {
+      await assert.rejects(socks5Connect('127.0.0.1', (proxy.address() as AddressInfo).port, '127.0.0.1', 5200, 1000), /invalid SOCKS5 CONNECT reply|closed during CONNECT/);
+    } finally { sockets.forEach((s) => s.destroy()); await new Promise<void>((r) => proxy.close(() => r())); }
+  }
+  await assert.rejects(socks5Connect('127.0.0.1', 1, 'x'.repeat(256), 5200), /invalid SOCKS5 target/);
+});
+
+test('config rejects invalid route ports, URL credentials, proxy ports and CIDRs', async () => {
+  const { loadConfig, parseRoute } = await import('../src/config.js');
+  for (const route of ['tcp://localhost:0', 'localhost:65536', 'wss://user:password@example.com/tmgw']) assert.throws(() => parseRoute(route));
+  assert.equal(parseRoute('ws://[::1]:5210/tmgw').kind, 'wss');
+  const env = { EDGE: 'tcp://localhost:5210', TMGW_TOKEN: TOKEN.toString() };
+  for (const cidr of ['', '127.0.0.1/', '127.0.0.0/33', '127.0.0.1/8/9', '::1/129']) assert.throws(() => loadConfig({ ...env, NODE_CIDRS: cidr }), /NODE_CIDRS/);
+  assert.throws(() => loadConfig({ ...env, SOCKS5: '127.0.0.1:70000' }), /SOCKS5 port/);
+});
+
+test('firmware failures retain their image id, and a disabled HTTP listener never advertises success', async () => {
+  const { createHash } = await import('node:crypto');
+  const bytes = Buffer.alloc(20, 0x7e);
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const id = sha256.slice(0, 16);
+  const gw = new Gateway(cfg(1));
+  const sent: { type: number; payload: Buffer }[] = [];
+  const reader = new FrameReader();
+  const internals = gw as unknown as { fromEdge(type: number, payload: Buffer): void; link: { write(b: Buffer): void }; log(msg: string): void };
+  internals.log = () => undefined;
+  internals.link = { write: (b) => reader.push(b, (type, payload) => sent.push({ type, payload: Buffer.from(payload) })) };
+  const head = Buffer.alloc(21);
+  head[0] = id.length; head.write(id, 1, 'latin1');
+  internals.fromEdge(T_IMAGE_META, Buffer.from(JSON.stringify({ id, size: bytes.length, sha256 })));
+  internals.fromEdge(T_IMAGE_CHUNK, Buffer.concat([head, Buffer.alloc(bytes.length, 0)]));
+  assert.equal(JSON.parse(sent[0]!.payload.toString()).id, id);
+  assert.equal(JSON.parse(sent[0]!.payload.toString()).ok, false);
+  sent.length = 0;
+  internals.fromEdge(T_IMAGE_META, Buffer.from(JSON.stringify({ id, size: bytes.length, sha256 })));
+  internals.fromEdge(T_IMAGE_CHUNK, Buffer.concat([head, bytes]));
+  assert.deepEqual(JSON.parse(sent[0]!.payload.toString()), { id, ok: false, error: 'firmware image server disabled', port: 0 });
 });

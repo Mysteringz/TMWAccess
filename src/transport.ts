@@ -41,6 +41,9 @@ async function openTcp(r: Extract<Route, { kind: 'tcp' }>, cfg: Config, timeoutM
       sock.once('connect', () => { clearTimeout(t); resolve(sock); });
       sock.once('error', (e) => { clearTimeout(t); reject(e); });
     });
+  // A target greeting may arrive with the SOCKS5 CONNECT response. Do not
+  // release it until the handshake has attached its reader.
+  s.pause();
   s.setNoDelay(true);
   s.setKeepAlive(true, 15_000);
   let lastErr: Error | undefined;
@@ -50,7 +53,7 @@ async function openTcp(r: Extract<Route, { kind: 'tcp' }>, cfg: Config, timeoutM
     write: (b) => void s.write(b),
     destroy: (reason) => s.destroy(reason),
     buffered: () => s.writableLength,
-    onData: (cb) => void s.on('data', cb),
+    onData: (cb) => { s.on('data', cb); s.resume(); },
     onClose: (cb) => void s.on('close', () => cb(lastErr)),
   };
 }
@@ -66,16 +69,27 @@ function openWebSocket(r: Extract<Route, { kind: 'wss' }>, cfg: Config, timeoutM
     const ws = new WebSocket(r.url, { headers } as unknown as string[]);
     ws.binaryType = 'arraybuffer';
     let opened = false;
+    let timedOut = false;
     let closeErr: Error | undefined;
     const dataCbs: ((b: Buffer) => void)[] = [];
     const closeCbs: ((e?: Error) => void)[] = [];
-    const t = setTimeout(() => { ws.close(); reject(new Error('WebSocket connect timed out')); }, timeoutMs);
+    const t = setTimeout(() => {
+      timedOut = true;
+      try { ws.close(); } catch { /* handshake already failed */ }
+      reject(new Error('WebSocket connect timed out'));
+    }, timeoutMs);
     ws.onopen = () => {
+      if (timedOut) { ws.close(); return; }
       opened = true;
       clearTimeout(t);
       resolve({
         route: r,
-        write: (b) => ws.send(b),
+        write: (b) => {
+          try { ws.send(b); } catch {
+            closeErr ??= new Error('WebSocket send failed');
+            try { ws.close(); } catch { /* already closing */ }
+          }
+        },
         destroy: (reason) => {
           closeErr = reason;
           try { ws.close(1000); } catch { /* already closing */ }
@@ -86,6 +100,11 @@ function openWebSocket(r: Extract<Route, { kind: 'wss' }>, cfg: Config, timeoutM
       });
     };
     ws.onmessage = (e) => {
+      if (!(e.data instanceof ArrayBuffer) || e.data.byteLength > 1024 * 1024) {
+        closeErr = new Error('bad WebSocket message');
+        ws.close(1009);
+        return;
+      }
       const b = Buffer.from(e.data as ArrayBuffer);
       for (const cb of dataCbs) cb(b);
     };
