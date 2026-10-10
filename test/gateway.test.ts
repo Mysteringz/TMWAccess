@@ -42,16 +42,19 @@ async function fakeEdge(token = TOKEN, port = 0): Promise<FakeEdge> {
     sockets.push(s);
     const r = new FrameReader();
     let ok = false;
-    s.on('data', (c) => r.push(c, (type, p) => {
-      if (type === T_HELLO) {
-        const h = JSON.parse(p.toString()) as { gatewayId: string; ts: number; nonce: string; mac: string };
-        ok = h.mac === helloMac(token, h.gatewayId, h.ts, h.nonce);
-        s.write(ok ? frame(T_WELCOME, Buffer.from('{"v":1,"edgeId":"fake"}')) : frame(T_DENY, Buffer.from('{"reason":"bad token"}')));
-      } else if (type === T_UPLINK && ok) {
-        const u = parseAddressed(p);
-        if (u) uplinks.push({ ...u, datagram: Buffer.from(u.datagram) });
-      }
-    }));
+    s.on('data', (c) => {
+      assert.ok(Buffer.isBuffer(c), 'the relay fixture must receive undecoded bytes');
+      r.push(c, (type, p) => {
+        if (type === T_HELLO) {
+          const h = JSON.parse(p.toString()) as { gatewayId: string; ts: number; nonce: string; mac: string };
+          ok = h.mac === helloMac(token, h.gatewayId, h.ts, h.nonce);
+          s.write(ok ? frame(T_WELCOME, Buffer.from('{"v":1,"edgeId":"fake"}')) : frame(T_DENY, Buffer.from('{"reason":"bad token"}')));
+        } else if (type === T_UPLINK && ok) {
+          const u = parseAddressed(p);
+          if (u) uplinks.push({ ...u, datagram: Buffer.from(u.datagram) });
+        }
+      });
+    });
     s.on('error', () => undefined);
   });
   await new Promise<void>((r) => server.listen(port, '127.0.0.1', () => r()));
@@ -197,7 +200,10 @@ test('commands reach a known node on its command port, and nothing else is relay
 });
 
 test('SOCKS5 client: CONNECT through a proxy and carry data', async () => {
-  const target = createServer((s) => s.on('data', (d) => s.write(Buffer.concat([Buffer.from('echo:'), d]))));
+  const target = createServer((s) => s.on('data', (d) => {
+    assert.ok(Buffer.isBuffer(d), 'the SOCKS5 fixture must receive undecoded bytes');
+    s.write(Buffer.concat([Buffer.from('echo:'), d]));
+  }));
   await new Promise<void>((r) => target.listen(0, '127.0.0.1', () => r()));
   const tport = (target.address() as AddressInfo).port;
   // A minimal SOCKS5 proxy: no auth, CONNECT to IPv4 only.
