@@ -30,7 +30,7 @@ cp .env.example .env
 | `EDGE` | Routes to TMedge, in preference order, e.g. `wss://gw.hkumyseat.com/tmgw,tcp://100.106.57.2:5210` |
 | `TMGW_TOKEN` | Same value as `TMGW_TOKEN` in TMedge's `.env` |
 | `CF_ACCESS_CLIENT_ID` / `_SECRET` | Cloudflare Access service token for the `wss://` route |
-| `NODE_CIDRS` | Only nodes on these networks are relayed (default `192.168.0.0/16`) |
+| `NODE_CIDRS` | Only nodes on these networks are relayed (set to the site subnet; the example uses `192.168.0.0/16`) |
 | `FAILBACK_S`, `QUEUE_MAX`, `STATUS_PORT` | See the comments in `.env.example` |
 
 A `tcp://` route to a Tailscale address needs Tailscale on the host. Host
@@ -122,7 +122,9 @@ bench test only.
 
 ### Security
 
-- It is outbound only. The only listening socket is UDP 5200 for the nodes,
-  and the status page is bound to 127.0.0.1.
+- The link to TMedge is outbound. UDP 5200 receives node reports, the firmware
+  HTTP listener on 5282 serves only `NODE_CIDRS`, and status binds to 127.0.0.1.
+- Raw `tcp://` routes require an authenticated encrypted network such as Tailscale.
+  Use `wss://` over other networks.
 - Secrets (`TMGW_TOKEN`, the Cloudflare Access token) come only from `.env`.
   That file is git-ignored and `.dockerignore`d, so it is never in the image.

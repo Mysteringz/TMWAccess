@@ -31,6 +31,8 @@ import { describe, openRoute, type Pipe } from './transport.js';
 export const VERSION = '1.0.0';
 const DEAD_LINK_MS = 45_000;
 const MAX_BUFFERED_BYTES = 2 * 1024 * 1024;
+const MAX_NODES = 512;
+const NODE_ROUTE_MS = 5 * 60_000;
 
 interface NodeSeen {
   uid: string;
@@ -46,6 +48,11 @@ type LinkState = 'down' | 'connecting' | 'up';
 
 export class Gateway extends EventEmitter {
   readonly nodes = new Map<string, NodeSeen>();
+  // Only the edge can decide which signed uplink is authentic. Remember a
+  // bounded set of heard addresses so a forged packet cannot overwrite a
+  // legitimate node's return route before the edge rejects it.
+  private readonly nodeRoutes = new Map<string, Map<string, number>>();
+  private readonly approvedRoutes = new Map<string, { addr: string; at: number }>();
   private readonly udp = dgram.createSocket({ type: 'udp4', reuseAddr: true });
   private readonly allow = new BlockList();
   private readonly images = new ImageStore(this.allow, (m) => this.log(m));
@@ -87,12 +94,18 @@ export class Gateway extends EventEmitter {
   async start(): Promise<void> {
     this.udp.on('message', (msg, r) => this.fromNode(msg, r.address, r.port));
     this.udp.on('error', (e) => this.log(`udp error: ${e.message}`));
-    await new Promise<void>((resolve) => this.udp.bind(this.cfg.listenPort, this.cfg.listenHost, () => resolve()));
+    await new Promise<void>((resolve, reject) => {
+      this.udp.once('error', reject);
+      this.udp.bind(this.cfg.listenPort, this.cfg.listenHost, () => {
+        this.udp.removeListener('error', reject);
+        resolve();
+      });
+    });
     this.log(`listening for TMnodes on udp ${this.cfg.listenHost}:${this.cfg.listenPort} (from ${this.cfg.nodeCidrs.join(', ')})`);
     this.connect();
     this.timers.push(setInterval(() => this.heartbeat(), 15_000));
     this.timers.push(setInterval(() => this.sendStats(), 10_000));
-    if (this.cfg.statusPort > 0) this.startStatus();
+    if (this.cfg.statusPort > 0) await this.startStatus();
     if (this.cfg.imagePort > 0) {
       // Firmware images are served on the node network, the one network the
       // nodes can reach; the same CIDR rule as the uplink applies.
@@ -105,18 +118,22 @@ export class Gateway extends EventEmitter {
   private sendImageResult(id: string, ok: boolean, error?: string): void {
     if (!ok) this.log(`image rejected: ${error ?? 'unknown'}`);
     this.link?.write(frame(T_IMAGE_READY, Buffer.from(JSON.stringify({
-      id, ok, error, port: this.cfg.imagePort,
+      id, ok: ok && this.cfg.imagePort > 0, error: error ?? (ok && this.cfg.imagePort === 0 ? 'firmware image server disabled' : undefined), port: this.cfg.imagePort,
     }))));
   }
 
   async stop(): Promise<void> {
+    if (this.stopped) return;
     this.stopped = true;
     for (const t of this.timers) clearInterval(t);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.failbackTimer) clearInterval(this.failbackTimer);
     this.link?.destroy();
     this.statusServer?.close();
-    await new Promise<void>((resolve) => this.udp.close(() => resolve()));
+    this.images.close();
+    await new Promise<void>((resolve) => {
+      try { this.udp.close(() => resolve()); } catch { resolve(); }
+    });
   }
 
   linkState(): LinkState {
@@ -138,10 +155,23 @@ export class Gateway extends EventEmitter {
       return;
     }
     const now = Date.now();
+    if (!this.nodes.has(shape.uid) && this.nodes.size >= MAX_NODES) {
+      this.pruneNodes(now);
+      if (this.nodes.size >= MAX_NODES) { this.counters.rejectedShape += 1; return; }
+    }
+    let routes = this.nodeRoutes.get(shape.uid);
+    if (!routes) { routes = new Map(); this.nodeRoutes.set(shape.uid, routes); }
+    routes.delete(addr);
+    routes.set(addr, now);
+    if (routes.size > 8) {
+      const approved = this.approvedRoutes.get(shape.uid);
+      const victim = [...routes.keys()].find(a => !approved || now - approved.at > NODE_ROUTE_MS || a !== approved.addr);
+      if (victim) routes.delete(victim);
+    }
     const n = this.nodes.get(shape.uid);
     if (n) {
-      n.addr = addr;
-      n.port = port;
+      const approved = this.approvedRoutes.get(shape.uid);
+      if (!approved || now - approved.at > NODE_ROUTE_MS || addr === approved.addr) { n.addr = addr; n.port = port; }
       n.lastSeen = now;
       n.packets += 1;
     } else {
@@ -181,41 +211,49 @@ export class Gateway extends EventEmitter {
         // Only a TM COMMAND, only to a node this gateway has heard from, at the
         // address it was heard from: the gateway must not become a relay into
         // the LAN for anything the edge (or someone on the link) asks.
-        if (!d || !shape || !TM_DOWNLINK_TYPES.has(shape.type) || !node || node.addr !== d.addr) {
+        if (!d || !shape || !TM_DOWNLINK_TYPES.has(shape.type) || !node || Date.now() - (this.nodeRoutes.get(shape.uid)?.get(d.addr) ?? 0) > NODE_ROUTE_MS) {
           this.counters.commandsRefused += 1;
           return;
         }
-        this.udp.send(d.datagram, this.cfg.nodeCommandPort, node.addr, (err) => {
+        // The authenticated edge only routes after packet admission. Keep its
+        // approved address out of eviction by unauthenticated LAN candidates.
+        this.approvedRoutes.set(shape.uid, { addr: d.addr, at: Date.now() }); node.addr = d.addr;
+        this.udp.send(d.datagram, this.cfg.nodeCommandPort, d.addr, (err) => {
           if (err) this.counters.lastError = `command send: ${err.message}`;
         });
         node.commands += 1;
         this.counters.commandsSent += 1;
-        this.log(`command for ${node.uid} delivered to ${node.addr}:${this.cfg.nodeCommandPort}`);
+        if (shape.type !== 0x12) this.log(`command for ${node.uid} delivered to ${d.addr}:${this.cfg.nodeCommandPort}`);
         return;
       }
       // A firmware image, in pieces. The gateway only holds and serves it;
       // whether it is the right image is settled by the node, against the
       // hash in the signed request the edge sent it.
       case T_IMAGE_META: {
+        let id = '';
         try {
           const meta = JSON.parse(payload.toString('utf8')) as { id: string; size: number; sha256: string };
+          if (meta && typeof meta.id === 'string' && /^[0-9a-f]{16}$/.test(meta.id)) id = meta.id;
           this.images.begin(meta);
         } catch (err) {
-          this.sendImageResult('', false, (err as Error).message);
+          this.sendImageResult(id, false, (err as Error).message);
         }
         return;
       }
       case T_IMAGE_CHUNK: {
         // [idLen u8][id][offset u32][bytes]
+        let id = '';
         try {
           const idLen = payload[0] ?? 0;
-          const id = payload.subarray(1, 1 + idLen).toString('latin1');
+          if (idLen !== 16 || payload.length < 1 + idLen + 4) throw new Error('bad image chunk');
+          id = payload.subarray(1, 1 + idLen).toString('latin1');
+          if (!/^[0-9a-f]{16}$/.test(id)) { id = ''; throw new Error('bad image chunk id'); }
           const offset = payload.readUInt32LE(1 + idLen);
           const bytes = payload.subarray(1 + idLen + 4);
           const done = this.images.chunk(id, offset, bytes);
           if (done) this.sendImageResult(done.id, true);
         } catch (err) {
-          this.sendImageResult('', false, (err as Error).message);
+          this.sendImageResult(id, false, (err as Error).message);
         }
         return;
       }
@@ -240,6 +278,7 @@ export class Gateway extends EventEmitter {
         if (!route || this.stopped) return;
         try {
           const pipe = await this.handshake(await openRoute(route, this.cfg));
+          if (this.stopped) { pipe.destroy(); return; }
           this.adopt(pipe, i);
           return;
         } catch (err) {
@@ -260,6 +299,8 @@ export class Gateway extends EventEmitter {
       const ts = Date.now();
       const nonce = randomBytes(8).toString('hex');
       let done = false;
+      const pendingFrames: { type: number; payload: Buffer }[] = [];
+      (pipe as Pipe & { pendingFrames?: typeof pendingFrames }).pendingFrames = pendingFrames;
       const t = setTimeout(() => finish(new Error('no WELCOME from edge')), 10_000);
       const finish = (err?: Error) => {
         if (done) return;
@@ -277,18 +318,23 @@ export class Gateway extends EventEmitter {
         if (done) return;
         try {
           reader.push(chunk, (type, payload) => {
+            if (done) { pendingFrames.push({ type, payload: Buffer.from(payload) }); return; }
             if (type === T_WELCOME) {
               try {
-                this.edgeId = (JSON.parse(payload.toString('utf8')) as { edgeId?: string }).edgeId ?? null;
+                const welcome = JSON.parse(payload.toString('utf8')) as { v?: number; edgeId?: string };
+                if (!welcome || welcome.v !== TMGW_VERSION || typeof welcome.edgeId !== 'string' || welcome.edgeId.length > 128) {
+                  throw new Error('bad WELCOME from edge');
+                }
+                this.edgeId = welcome.edgeId;
+                finish();
               } catch {
-                this.edgeId = null;
+                finish(new Error('bad WELCOME from edge'));
               }
-              finish();
             } else if (type === T_DENY) {
               this.counters.denies += 1;
               // Refused credentials will not fix themselves: back off hard.
               this.backoffMs = 60_000;
-              finish(new Error(`edge refused this gateway: ${payload.toString('utf8')}`));
+              finish(new Error(`edge refused this gateway: ${payload.toString('utf8').slice(0, 512)}`));
             }
           });
         } catch (err) {
@@ -319,18 +365,26 @@ export class Gateway extends EventEmitter {
       }
     });
     pipe.onClose((err) => {
-      if (this.link !== pipe || this.switching) return;
+      if (this.link !== pipe) return;
+      if (this.switching) { this.lastFromEdge = 0; return; }
       this.link = null;
       this.linkDown(err?.message ?? this.counters.lastError ?? 'link closed');
     });
     // The edge has already replaced the old session with this one.
     old?.destroy();
-    const flushed = this.queue.length;
-    for (const f of this.queue) pipe.write(f);
+    let flushed = 0;
+    for (const f of this.queue) {
+      if (pipe.buffered() > MAX_BUFFERED_BYTES) { this.counters.droppedBackpressure += this.queue.length - flushed; break; }
+      pipe.write(f);
+      flushed += 1;
+    }
     this.counters.relayed += flushed;
     this.queue = [];
     const fallback = index > 0 ? ' [fallback]' : '';
     this.log(`link up to edge ${this.edgeId ?? '?'} via ${describe(pipe.route)}${fallback}${flushed ? `, flushed ${flushed} queued datagram(s)` : ''}`);
+    for (const f of (pipe as Pipe & { pendingFrames?: { type: number; payload: Buffer }[] }).pendingFrames ?? []) {
+      this.fromEdge(f.type, f.payload);
+    }
     this.sendStats();
     this.emit('up');
     this.scheduleFailback();
@@ -342,6 +396,7 @@ export class Gateway extends EventEmitter {
     this.failbackTimer = null;
     if (this.routeIndex <= 0 || this.cfg.failbackMs <= 0) return;
     this.failbackTimer = setInterval(() => {
+      if (this.switching) return;
       void (async () => {
         for (let i = 0; i < this.routeIndex; i++) {
           const route = this.cfg.routes[i];
@@ -349,6 +404,7 @@ export class Gateway extends EventEmitter {
           this.switching = true;
           try {
             const pipe = await this.handshake(await openRoute(route, this.cfg));
+            if (this.stopped) { pipe.destroy(); return; }
             this.log(`preferred route ${describe(route)} is back; switching`);
             this.adopt(pipe, i);
             return;
@@ -356,6 +412,12 @@ export class Gateway extends EventEmitter {
             /* still down; stay on the fallback */
           } finally {
             this.switching = false;
+            // The old pipe can die while a preferred-route probe is pending.
+            // If the probe fails, return to ordinary reconnect handling.
+            if (!this.stopped && this.link && this.state === 'up' && this.lastFromEdge === 0) {
+              this.link = null;
+              this.linkDown('fallback closed during preferred-route probe');
+            }
           }
         }
       })();
@@ -366,7 +428,7 @@ export class Gateway extends EventEmitter {
     const was = this.state;
     this.state = 'down';
     this.routeIndex = -1;
-    this.counters.lastError = reason;
+    this.counters.lastError = reason.slice(0, 1024);
     if (this.failbackTimer) clearInterval(this.failbackTimer);
     this.failbackTimer = null;
     if (was === 'up') this.emit('down');
@@ -378,6 +440,7 @@ export class Gateway extends EventEmitter {
   }
 
   private heartbeat(): void {
+    this.pruneNodes(Date.now());
     if (this.state !== 'up' || !this.link) return;
     // TCP keepalive can take minutes to notice a dead path (a VPN or Wi-Fi
     // roam); the edge pings every 10 s, so 45 s of silence means it is gone.
@@ -388,6 +451,17 @@ export class Gateway extends EventEmitter {
     const b = Buffer.alloc(8);
     b.writeBigUInt64LE(BigInt(Date.now()));
     this.link.write(frame(T_PING, b));
+  }
+
+  private pruneNodes(now: number): void {
+    for (const [uid, node] of this.nodes) if (now - node.lastSeen > NODE_ROUTE_MS) {
+      this.nodes.delete(uid);
+      this.nodeRoutes.delete(uid);
+      this.approvedRoutes.delete(uid);
+    }
+    for (const routes of this.nodeRoutes.values()) {
+      for (const [addr, seen] of routes) if (now - seen > NODE_ROUTE_MS) routes.delete(addr);
+    }
   }
 
   status() {
@@ -415,22 +489,29 @@ export class Gateway extends EventEmitter {
     const stats = {
       version: VERSION, uptimeS: s.uptimeS, route: s.link.route, fallback: s.link.fallback, queue: s.queue,
       nodes: s.nodes.filter((n) => n.ageS < 60).length,
-      nodeList: s.nodes.map((n) => ({ uid: n.uid, addr: n.addr, ageS: n.ageS, packets: n.packets })),
+      nodeList: s.nodes.slice(-128).map((n) => ({ uid: n.uid, addr: n.addr, ageS: n.ageS, packets: n.packets })),
       ...this.counters,
     };
     this.link.write(frame(T_STATS, Buffer.from(JSON.stringify(stats))));
   }
 
-  private startStatus(): void {
+  private startStatus(): Promise<void> {
     // Local diagnostics only (127.0.0.1): what the gateway sees and whether the link is up.
     this.statusServer = createServer((sock) => {
       sock.once('data', () => {
         const body = JSON.stringify(this.status(), null, 2);
         sock.end(`HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: ${Buffer.byteLength(body)}\r\nconnection: close\r\n\r\n${body}`);
       });
+      sock.setTimeout(5000, () => sock.destroy());
       sock.on('error', () => undefined);
     });
-    this.statusServer.listen(this.cfg.statusPort, '127.0.0.1');
+    return new Promise((resolve, reject) => {
+      this.statusServer!.once('error', reject);
+      this.statusServer!.listen(this.cfg.statusPort, '127.0.0.1', () => {
+        this.statusServer!.removeListener('error', reject);
+        resolve();
+      });
+    });
   }
 
   private log(msg: string): void {

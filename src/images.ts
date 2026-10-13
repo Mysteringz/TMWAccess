@@ -43,10 +43,10 @@ export class ImageStore {
 
   /** Start receiving an image. Any half-received one is dropped. */
   begin(meta: ImageMeta): void {
-    if (!/^[0-9a-f]{16}$/.test(meta.id)) throw new Error('bad image id');
-    if (!/^[0-9a-f]{64}$/.test(meta.sha256)) throw new Error('bad image hash');
+    if (!meta || typeof meta !== 'object' || typeof meta.id !== 'string' || !/^[0-9a-f]{16}$/.test(meta.id)) throw new Error('bad image id');
+    if (typeof meta.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(meta.sha256) || meta.id !== meta.sha256.slice(0, 16)) throw new Error('bad image hash');
     if (!Number.isInteger(meta.size) || meta.size <= 0 || meta.size > 8 * 1024 * 1024) throw new Error('bad image size');
-    this.pending = { meta, buf: Buffer.alloc(meta.size), got: 0 };
+    this.pending = { meta: { ...meta }, buf: Buffer.alloc(meta.size), got: 0 };
     this.log(`image ${meta.id}: receiving ${meta.size} bytes`);
   }
 
@@ -57,7 +57,9 @@ export class ImageStore {
   chunk(id: string, offset: number, bytes: Buffer): ImageMeta | null {
     const p = this.pending;
     if (!p || p.meta.id !== id) throw new Error('no such image in flight');
-    if (offset < 0 || offset + bytes.length > p.meta.size) throw new Error('chunk outside the image');
+    if (!Number.isSafeInteger(offset) || offset < 0 || offset + bytes.length > p.meta.size) throw new Error('chunk outside the image');
+    // The link is ordered: overlap/repeated chunks must never count as new bytes.
+    if (offset !== p.got || bytes.length === 0) throw new Error('chunk out of order or empty');
     bytes.copy(p.buf, offset);
     p.got += bytes.length;
     return p.got >= p.meta.size ? this.finish(id) : null;
@@ -68,11 +70,15 @@ export class ImageStore {
     if (!p || p.meta.id !== id) throw new Error('no such image in flight');
     if (p.got !== p.meta.size) throw new Error(`have ${p.got} of ${p.meta.size} bytes`);
     const sha = createHash('sha256').update(p.buf).digest('hex');
-    if (sha !== p.meta.sha256) throw new Error('image hash mismatch');
+    if (sha !== p.meta.sha256) {
+      this.pending = null;
+      throw new Error('image hash mismatch');
+    }
     this.ready.set(id, { meta: p.meta, bytes: p.buf, storedAt: Date.now() });
     this.pending = null;
     for (const [oldest] of [...this.ready.entries()].sort((a, b) => a[1].storedAt - b[1].storedAt).slice(0, -2)) {
       this.ready.delete(oldest);
+      this.serves.delete(oldest);
     }
     this.log(`image ${id}: ready, ${p.meta.size} bytes`);
     return p.meta;
@@ -92,6 +98,10 @@ export class ImageStore {
         const fam = isIP(from);
         if (!fam || !this.allow.check(from, fam === 6 ? 'ipv6' : 'ipv4')) {
           res.writeHead(403).end('not your network\n');
+          return;
+        }
+        if (req.method !== 'GET' && req.method !== 'HEAD') {
+          res.writeHead(405, { Allow: 'GET, HEAD' }).end();
           return;
         }
         const m = /^\/fw\/([0-9a-f]{16})\.bin$/.exec((req.url ?? '').split('?')[0] ?? '');
@@ -118,6 +128,7 @@ export class ImageStore {
 
   close(): void {
     this.server?.close();
+    this.server?.closeAllConnections();
     this.server = null;
   }
 }

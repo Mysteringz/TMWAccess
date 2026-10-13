@@ -6,8 +6,8 @@
 #
 # Host networking (Linux): the gateway must see each node's real LAN address
 # -- it relays only from NODE_CIDRS and sends commands back to that address --
-# and Docker's bridge NAT can hide it. The gateway opens no inbound port other
-# than UDP 5200 for the nodes; its link to TMedge is outbound only.
+# and Docker's bridge NAT can hide it. UDP 5200 receives reports; HTTP 5282
+# serves firmware only to NODE_CIDRS. Its link to TMedge is outbound only.
 
 services:
   tmwaccess:
@@ -16,6 +16,9 @@ services:
     restart: unless-stopped
     env_file: .env
     network_mode: host
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     # Docker Desktop (macOS/Windows) without host networking: remove
     # network_mode above and publish the node port instead. Uplink then works,
     # but every node appears to come from Docker's NAT address (e.g.

@@ -74,3 +74,39 @@ test('only the node network may fetch an image', async () => {
     s.close();
   }
 });
+
+test('overlapping, repeated, empty and non-integer chunks cannot falsely complete an image', () => {
+  const s = store();
+  s.begin(meta);
+  s.chunk(meta.id, 0, bytes.subarray(0, 3000));
+  assert.throws(() => s.chunk(meta.id, 0, bytes.subarray(0, 2000)), /out of order/);
+  assert.throws(() => s.chunk(meta.id, 2999, bytes.subarray(3000)), /out of order/);
+  assert.throws(() => s.chunk(meta.id, 3000, Buffer.alloc(0)), /empty/);
+  assert.throws(() => s.chunk(meta.id, NaN, bytes.subarray(3000)), /outside/);
+  assert.throws(() => s.chunk(meta.id, 3000.5, bytes.subarray(3000)), /outside/);
+  assert.equal(s.has(meta.id), false);
+  assert.ok(s.chunk(meta.id, 3000, bytes.subarray(3000)));
+});
+
+test('image identity must match the hash and metadata is copied before transfer', () => {
+  const s = store();
+  assert.throws(() => s.begin({ ...meta, id: '0123456789abcdef' }), /bad image hash/);
+  const mutable = { ...meta };
+  s.begin(mutable);
+  mutable.size = 1;
+  assert.equal(s.chunk(meta.id, 0, bytes)?.size, bytes.length);
+});
+
+test('firmware HTTP rejects methods other than GET and HEAD', async () => {
+  const s = store();
+  s.begin(meta); s.chunk(meta.id, 0, bytes);
+  const port = await s.listen(0, '127.0.0.1');
+  try {
+    const url = `http://127.0.0.1:${port}/fw/${meta.id}.bin`;
+    assert.equal((await fetch(url, { method: 'POST' })).status, 405);
+    const head = await fetch(url, { method: 'HEAD' });
+    assert.equal(head.status, 200);
+    assert.equal((await head.arrayBuffer()).byteLength, 0);
+    assert.equal(head.headers.get('content-length'), String(bytes.length));
+  } finally { s.close(); }
+});
